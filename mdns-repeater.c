@@ -29,6 +29,7 @@
 #include <stdarg.h>
 #include <syslog.h>
 #include <unistd.h>
+#include <pwd.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <net/if.h>
@@ -46,11 +47,11 @@
 #define MAX_SUBNETS 16
 
 struct if_sock {
-	const char *ifname;		/* interface name  */
-	int sockfd;				/* socket filedesc */
+	const char *ifname;	/* interface name  */
+	int sockfd;		/* socket filedesc */
 	struct in_addr addr;	/* interface addr  */
 	struct in_addr mask;	/* interface mask  */
-	struct in_addr net;		/* interface network (computed) */
+	struct in_addr net;	/* interface network (computed) */
 };
 
 struct subnet {
@@ -78,6 +79,8 @@ int debug = 0;
 int shutdown_flag = 0;
 
 char *pid_file = PIDFILE;
+
+const struct passwd* user = NULL;
 
 void log_message(int loglevel, char *fmt_str, ...) {
 	va_list ap;
@@ -211,6 +214,12 @@ static int create_send_sock(int recv_sockfd, const char *ifname, struct if_sock 
 		return r;
 	}
 
+	int ttl = 255; // IP TTL should be 255: https://datatracker.ietf.org/doc/html/rfc6762#section-11
+	if ((r = setsockopt(sd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl))) < 0) {
+		log_message(LOG_ERR, "send setsockopt(IP_MULTICAST_TTL): %s", strerror(errno));
+		return r;
+	}
+
 	char *addr_str = strdup(inet_ntoa(sockdata->addr));
 	char *mask_str = strdup(inet_ntoa(sockdata->mask));
 	char *net_str  = strdup(inet_ntoa(sockdata->net));
@@ -235,6 +244,7 @@ static ssize_t send_packet(int fd, const void *data, size_t len) {
 }
 
 static void mdns_repeater_shutdown(int sig) {
+	(void)sig;
 	shutdown_flag = 1;
 }
 
@@ -289,7 +299,10 @@ static void daemonize() {
 
 	setsid();
 	umask(0027);
-	chdir("/");
+	if (chdir("/") < 0) {
+		log_message(LOG_ERR, "unable to change to root directory");
+		exit(1);
+	}
 
 	// close all std fd and reopen /dev/null for them
 	int i;
@@ -312,9 +325,21 @@ static void daemonize() {
 	}
 }
 
+static void switch_user() {
+	errno = 0;
+	if (setgid(user->pw_gid) != 0) {
+		log_message(LOG_ERR, "Failed to switch to group %d - %s", user->pw_gid, strerror(errno));
+		exit(2);
+	} else if (setuid(user->pw_uid) != 0) {
+		log_message(LOG_ERR, "Failed to switch to user %s (%d) - %s", user->pw_name, user->pw_uid, strerror(errno));
+		exit(2);
+	}
+}
+
 static void show_help(const char *progname) {
 	fprintf(stderr, "mDNS repeater (version " MDNS_REPEATER_VERSION ")\n");
 	fprintf(stderr, "Copyright (C) 2011 Darell Tan\n\n");
+
 	fprintf(stderr, "usage: %s [ -f ] <ifdev> ...\n", progname);
 	fprintf(stderr, "\n"
 					"<ifdev> specifies an interface like \"eth0\"\n"
@@ -322,11 +347,10 @@ static void show_help(const char *progname) {
 					"maximum number of interfaces is 5\n"
 					"\n"
 					" flags:\n"
-					"	-f	runs in foreground\n"
-					"	-d	log debug messages when runs in foreground\n"
 					"	-b	blacklist subnet (eg. 192.168.1.1/24)\n"
 					"	-w	whitelist subnet (eg. 192.168.1.1/24)\n"
 					"	-p	specifies the pid file path (default: " PIDFILE ")\n"
+					"	-u	run as this user (by name)\n"
 					"	-h	shows this help\n"
 					"\n"
 		);
@@ -387,7 +411,7 @@ static int parse_opts(int argc, char *argv[]) {
 	int help = 0;
 	struct subnet *ss;
 	char *msg;
-	while ((c = getopt(argc, argv, "hfdp:b:w:")) != -1) {
+	while ((c = getopt(argc, argv, "hfdp:b:w:u:")) != -1) {
 		switch (c) {
 			case 'h': help = 1; break;
 			case 'f': foreground = 1; break;
@@ -470,6 +494,14 @@ static int parse_opts(int argc, char *argv[]) {
 				fputs("\n", stderr);
 				break;
 
+			case 'u': {
+				if ((user = getpwnam(optarg)) == NULL) {
+					log_message(LOG_ERR, "No such user '%s'", optarg);
+					exit(2);
+				}
+				break;
+			}
+
 			default:
 				log_message(LOG_ERR, "unknown option %c", optopt);
 				exit(2);
@@ -498,16 +530,6 @@ int main(int argc, char *argv[]) {
 	}
 
 	openlog(PACKAGE, LOG_PID | LOG_CONS, LOG_DAEMON);
-	if (! foreground)
-		daemonize();
-	else {
-		// check for pid file when running in foreground
-		running_pid = already_running();
-		if (running_pid != -1) {
-			log_message(LOG_ERR, "already running as pid %d", running_pid);
-			exit(1);
-		}
-	}
 
 	// create receiving socket
 	server_sockfd = create_recv_sock();
@@ -532,6 +554,21 @@ int main(int argc, char *argv[]) {
 			goto end_main;
 		}
 		num_socks++;
+	}
+
+	if (user) {
+		switch_user();
+	}
+
+	if (! foreground)
+		daemonize();
+	else {
+		// check for pid file when running in foreground
+		running_pid = already_running();
+		if (running_pid != -1) {
+			log_message(LOG_ERR, "already running as pid %d", running_pid);
+			exit(1);
+		}
 	}
 
 	pkt_data = malloc(PACKET_SIZE);
@@ -564,16 +601,22 @@ int main(int argc, char *argv[]) {
 			}
 
 			int j;
-			char self_generated_packet = 0;
+			char discard = 0;
+			char our_net = 0;
 			for (j = 0; j < num_socks; j++) {
+				// make sure packet originated from specified networks
+				if ((fromaddr.sin_addr.s_addr & socks[j].mask.s_addr) == socks[j].net.s_addr) {
+					our_net = 1;
+				}
+
 				// check for loopback
 				if (fromaddr.sin_addr.s_addr == socks[j].addr.s_addr) {
-					self_generated_packet = 1;
+					discard = 1;
 					break;
 				}
 			}
 
-			if (self_generated_packet)
+			if (discard || !our_net)
 				continue;
 
 			if (num_whitelisted_subnets != 0) {
