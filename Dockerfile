@@ -1,11 +1,11 @@
-FROM monstrenyatko/alpine AS builder
+FROM monstrenyatko/alpine:2024-12-01 AS builder
 ARG MDNS_REPEATER_VERSION=local
 ADD mdns-repeater.c mdns-repeater.c
 RUN set -ex && \
     apk add build-base && \
     gcc -o /bin/mdns-repeater mdns-repeater.c -DMDNS_REPEATER_VERSION=\"${MDNS_REPEATER_VERSION}\"
 
-FROM monstrenyatko/alpine
+FROM monstrenyatko/alpine:2024-12-01
 
 LABEL maintainer="Oleg Kovalenko <monstrenyatko@gmail.com>"
 

@@ -1,7 +1,7 @@
 version: '3'
 services:
   mdns-repeater:
-    image: ${DOCKER_REGISTRY}monstrenyatko/mdns-repeater
+    image: darendarrow/docker-mdns-repeater
     container_name: mdns-repeater
     restart: unless-stopped
     command: mdns-repeater-app -f $MDNS_REPEATER_INTERFACES
